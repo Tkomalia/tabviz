@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+data/openapi.json
+data/entity_meta_cache.json
+.DS_Store
+.history/
+data/

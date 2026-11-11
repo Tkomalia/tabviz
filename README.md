@@ -29,6 +29,8 @@ python scripts/fetch_openapi.py
 ```bash
 streamlit run app.py
 ```
+!Ss08sa11sa15
+hgdvhTTR42£@!gf
 
 1. Введите логин/пароль платформы (хранятся только в памяти текущей сессии).
 2. Выберите домен и реестр в левой панели.

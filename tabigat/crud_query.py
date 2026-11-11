@@ -29,12 +29,20 @@ def build_params(
     search: str | None = None,
     filters: list[dict[str, Any]] | None = None,
     fields: list[str] | None = None,
+    joins: list[str] | None = None,
 ) -> dict[str, Any]:
     """Формирует dict query-параметров для get_many.
 
     filters: список {"field": str, "op": "$cont", "value": Any}
+    joins: имена связей crud (`join=person`) — связанные записи приходят
+        вложенными в каждую строку ответа; связь должна быть разрешена на
+        бэкенде, иначе запрос вернёт ошибку.
     """
     params: dict[str, Any] = {"page": page, "limit": limit}
+
+    if joins:
+        # requests сериализует список как повторяющиеся ключи join=...&join=...
+        params["join"] = list(joins)
 
     if sort_field:
         params["sort"] = f"{sort_field},{sort_dir}"

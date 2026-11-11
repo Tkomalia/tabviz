@@ -17,6 +17,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from . import xml_files
 from .api import ApiClient, ApiError
 
 # поле реестра Processes, в котором лежит граф процесса
@@ -25,6 +26,26 @@ _FLOW_FIELD = "flow"
 _NAME_FIELDS = ("name", "title", "process_name", "template_name", "entity")
 # куда идём за документом для ссылок type=doc (см. _resolve_doc_ref)
 _DOCS_PATH = "/api/v1/docs/main/docs"
+
+# топики elicense, для которых можно проверить тестовые файлы (см.
+# _render_test_files_check): search_field — поле в собранном body с искомым
+# никадом, file_pattern — общая часть имени файлов запрос/ответ этого топика
+# (файлы вида <timestamp>_<file_pattern>_request.xml / _response.xml).
+TOPIC_FILE_ACTIONS: dict[str, dict[str, str]] = {
+    "send_demand": {"search_field": "nikad", "file_pattern": "demand"},
+    "get_document_nikad": {"search_field": "number", "file_pattern": "nikad_document"},
+    "send_document": {"search_field": "request_identification_number", "file_pattern": "pdf"},
+}
+
+# REST-эндпоинты, соответствующие этим топикам elicense — поля собранного body
+# совпадают с DTO этих эндпоинтов один в один, поэтому его можно отправлять
+# напрямую (после правок пользователя) — см. _render_call_section.
+# Публичная — переиспользуется страницей processes_el.py для переотправки.
+TOPIC_CALL_PATHS: dict[str, str] = {
+    "send_demand": "/api/v1/integrations/elicense/send-demand",
+    "get_document_nikad": "/api/v1/integrations/elicense/get-document-nikad",
+    "send_document": "/api/v1/integrations/elicense/send-document",
+}
 
 
 def _parse_flow(value: Any) -> dict | None:
@@ -285,22 +306,51 @@ def assemble(
     return result
 
 
+def body_for_topic(
+    process: dict, action_name: str, client: ApiClient, doc_cache: dict | None = None,
+) -> dict | None:
+    """Собранный body первого microservice_call с этим топиком во flow процесса.
+
+    То же, что показывает вкладка «Сборка body/query» (см. _render_body_assembly),
+    но без UI — для страниц, которым нужно готовое тело запроса по топику
+    (см. processes_el._resend_body). action_name сравнивается с последним
+    сегментом service_topic. Ходит в API за документами (ссылки type=doc),
+    поэтому вызывать только по явному действию пользователя."""
+    flow = _parse_flow(process.get(_FLOW_FIELD))
+    if flow is None:
+        return None
+    for _node, action, idx in _iter_microservice_calls(flow):
+        data = action.get("data") or {}
+        if (data.get("service_topic") or "").rsplit(".", 1)[-1] == action_name:
+            return assemble(
+                data.get("body"), idx, client,
+                doc_cache if doc_cache is not None else {},
+            )
+    return None
+
+
+def _iter_microservice_calls(flow: dict):
+    """(узел, действие, индекс flow) для всех microservice_call узлов service_task одного flow."""
+    idx = _index_nodes(flow)
+    for node in flow.get("nodes") or []:
+        if node.get("type") != "service_task":
+            continue
+        for action in node.get("actions") or []:
+            if action.get("type") != "microservice_call":
+                continue
+            yield node, action, idx
+
+
 def _microservice_calls(
     flows: list[dict], topic: str | None
 ) -> list[tuple[dict, dict, dict[str, dict]]]:
     """(узел, действие microservice_call, индекс родного flow); topic=None — без фильтра."""
     out: list[tuple[dict, dict, dict[str, dict]]] = []
     for flow in flows:
-        idx = _index_nodes(flow)
-        for node in flow.get("nodes") or []:
-            if node.get("type") != "service_task":
+        for node, action, idx in _iter_microservice_calls(flow):
+            if topic is not None and (action.get("data") or {}).get("service_topic") != topic:
                 continue
-            for action in node.get("actions") or []:
-                if action.get("type") != "microservice_call":
-                    continue
-                if topic is not None and (action.get("data") or {}).get("service_topic") != topic:
-                    continue
-                out.append((node, action, idx))
+            out.append((node, action, idx))
     return out
 
 
@@ -333,6 +383,136 @@ def _render_section(counter: Counter, label: str, empty_msg: str) -> None:
                 ),
             },
         )
+
+
+def matched_test_files(files: list[str], pattern: str) -> list[str]:
+    """Из списка имён файлов находит request-файлы данного типа (pattern —
+    kind из xml_files.parse_filename, точное сравнение — иначе, например,
+    'nikad_demand_request.xml' ложно матчится под pattern='demand', т.к. оба
+    оканчиваются на '_demand_request.xml') и для каждого добавляет производное
+    имя response-файла. Порядок: request, response, request, response, ..."""
+    result: list[str] = []
+    for f in files:
+        parsed = xml_files.parse_filename(f)
+        if parsed == (pattern, "request"):
+            result.append(f)
+            result.append(xml_files.response_filename(f))
+    return result
+
+
+def _render_test_files_check(
+    client: ApiClient, topic: str | None, body: dict | None, state_key: str,
+) -> None:
+    """Кнопка «Проверить запросы»: ищет тестовые файлы elicense по никаду из
+    body и показывает содержимое найденных пар request/response."""
+    action_name = (topic or "").rsplit(".", 1)[-1]
+    conf = TOPIC_FILE_ACTIONS.get(action_name)
+    if conf is None:
+        return
+
+    search_field, pattern = conf["search_field"], conf["file_pattern"]
+    text = (body or {}).get(search_field)
+    if not isinstance(text, str) or not text.strip():
+        st.caption(
+            f"Для проверки запросов нужно строковое значение поля `{search_field}` "
+            "в собранном body (сейчас недоступно)."
+        )
+        return
+
+    st.markdown("**Тестовые файлы elicense:**")
+    result_key = f"{state_key}::testfiles::{action_name}::{text}"
+    check = st.button("🔎 Проверить запросы", key=f"{state_key}::checkfiles::{action_name}")
+    if check:
+        try:
+            with st.spinner(f"Поиск файлов по «{text}»..."):
+                resp = client.search_test_files(text)
+        except ApiError as exc:
+            st.error(str(exc))
+        else:
+            files = resp.get("data") if isinstance(resp, dict) else None
+            st.session_state[result_key] = matched_test_files(files or [], pattern)
+
+    matched = st.session_state.get(result_key)
+    if matched is None:
+        return
+    if not matched:
+        st.info(f"Файлы с текстом «{text}» не найдены.")
+        return
+
+    st.caption(f"Найдено файлов: {len(matched)}")
+    for i, filename in enumerate(matched):
+        with st.expander(filename, expanded=(i == 0)):
+            content_key = f"elfilecontent::{filename}"
+            if content_key not in st.session_state:
+                try:
+                    with st.spinner("Загрузка содержимого..."):
+                        st.session_state[content_key] = client.download_test_file(filename)
+                except ApiError as exc:
+                    st.session_state[content_key] = f"[Ошибка загрузки: {exc}]"
+            st.code(st.session_state[content_key], language="xml", wrap_lines=True)
+
+
+def _render_call_section(
+    client: ApiClient, action_name: str, body: dict | None,
+    state_key: str, call_id: str,
+) -> None:
+    """Позволяет скорректировать собранный body и повторно вызвать REST-метод,
+    соответствующий данному топику elicense (см. TOPIC_CALL_PATHS)."""
+    path = TOPIC_CALL_PATHS.get(action_name)
+    if path is None:
+        return
+
+    st.markdown("**Повторный вызов метода:**")
+    st.caption(f"`POST {path}`")
+
+    text_key = f"{state_key}::callbody::{call_id}"
+    if text_key not in st.session_state:
+        st.session_state[text_key] = json.dumps(body or {}, ensure_ascii=False, indent=2)
+
+    edited = st.text_area(
+        "Тело запроса (можно скорректировать перед вызовом)",
+        key=text_key, height=300,
+    )
+
+    error: str | None = None
+    parsed_body: dict | None = None
+    try:
+        parsed_body = json.loads(edited)
+    except (ValueError, TypeError) as exc:
+        error = f"Невалидный JSON: {exc}"
+    else:
+        if not isinstance(parsed_body, dict):
+            parsed_body = None
+            error = "Ожидается JSON-объект (словарь)."
+
+    if error:
+        st.error(error)
+
+    call = st.button(
+        "🚀 Вызвать метод", type="primary", key=f"{state_key}::docall::{call_id}",
+        disabled=error is not None,
+    )
+    result_key = f"{state_key}::callresult::{call_id}"
+    if call and parsed_body is not None:
+        try:
+            with st.spinner(f"Вызов {path}..."):
+                response = client.post(path, parsed_body)
+        except ApiError as exc:
+            st.session_state[result_key] = ("error", str(exc))
+        else:
+            st.session_state[result_key] = ("ok", response)
+
+    result = st.session_state.get(result_key)
+    if result:
+        status, payload = result
+        if status == "ok":
+            st.success("Вызов выполнен.")
+            if isinstance(payload, (dict, list)):
+                st.json(payload)
+            else:
+                st.code(str(payload), wrap_lines=True)
+        else:
+            st.error(payload)
 
 
 def _render_body_assembly(
@@ -387,9 +567,24 @@ def _render_body_assembly(
     else:
         st.caption("query пуст или отсутствует.")
 
+    action_name = (data.get("service_topic") or "").rsplit(".", 1)[-1]
+    call_id = f"{node.get('id')}::{action.get('id')}"
 
-def render(rows: list[dict], state_key: str, client: ApiClient) -> None:
-    """Рисует панель разбора flow под таблицей (если в строках есть flow с nodes)."""
+    st.divider()
+    _render_call_section(client, action_name, body, state_key, call_id)
+
+    st.divider()
+    _render_test_files_check(client, data.get("service_topic"), body, state_key)
+
+
+def render(
+    rows: list[dict], state_key: str, client: ApiClient, *, show_picker: bool = True,
+) -> None:
+    """Рисует панель разбора flow (если в строках есть flow с nodes).
+
+    show_picker=False пропускает выбор процесса и использует все переданные
+    rows как есть — для страниц с уже одним конкретным процессом (см.
+    el_integration.py), где выбор из одного варианта был бы лишним."""
     flows_with_rows = _flows_with_rows(rows)
     if not flows_with_rows:
         return
@@ -401,16 +596,19 @@ def render(rows: list[dict], state_key: str, client: ApiClient) -> None:
         "действия `microservice_call` — по `service_topic`."
     )
 
-    all_label = f"— Все процессы (сумма: {len(flows_with_rows)}) —"
-    options = [all_label] + [
-        _process_label(row, i) for i, (row, _) in enumerate(flows_with_rows)
-    ]
-    choice = st.selectbox("Процесс", options, key=f"{state_key}::flowpick")
+    if show_picker:
+        all_label = f"— Все процессы (сумма: {len(flows_with_rows)}) —"
+        options = [all_label] + [
+            _process_label(row, i) for i, (row, _) in enumerate(flows_with_rows)
+        ]
+        choice = st.selectbox("Процесс", options, key=f"{state_key}::flowpick")
 
-    if choice == all_label:
-        selected = [flow for _, flow in flows_with_rows]
+        if choice == all_label:
+            selected = [flow for _, flow in flows_with_rows]
+        else:
+            selected = [flows_with_rows[options.index(choice) - 1][1]]
     else:
-        selected = [flows_with_rows[options.index(choice) - 1][1]]
+        selected = [flow for _, flow in flows_with_rows]
 
     stats = analyze(selected)
     node_types = stats["node_types"]

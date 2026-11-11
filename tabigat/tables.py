@@ -8,10 +8,38 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from . import config, crud_query, custom_fields, doc_input_fields, flow_breakdown, meta_cache
+from . import config, crud_query, custom_fields, meta_cache
 from .api import ApiClient, ApiError
 
 _NO_VALUE_OPS = {"$isnull", "$notnull"}
+
+# Реестры, записи которых можно править прямо на странице: путь → поля.
+# Список точечный, а не «любое поле любого реестра»: правка вслепую по всем
+# реестрам слишком легко портит данные, а PATCH здесь идёт в боевой API.
+EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    "/api/v1/users/orgtree/orgtree": ("licensor_code",),
+}
+
+# JSON-поля, которые правятся как JSON целиком (см. _render_json_field_editor):
+# путь → поля. signatures у Docs — ЭЦП документа с ссылками на PDF/CMS в MinIO;
+# правка нужна, например, чтобы привязать signed_pdf_* к последней подписи,
+# которую читает send-document (см. processes_el._render_signed_pdf_fix).
+JSON_EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    "/api/v1/docs/main/docs": ("signatures",),
+}
+
+# Связи, которые подтягиваем вместе с реестром (crud `join`): путь → имена
+# связей в ответе. Имена — свойства схемы из OpenAPI, не названия сущностей:
+# у Users связь с персоной называется `person` (одна), у Persons связь с
+# оргструктурой — `orgtree` (список). entity-meta имён связей не отдаёт
+# (возвращает их без name), поэтому список задан явно.
+RELATION_JOINS: dict[str, tuple[str, ...]] = {
+    "/api/v1/users/main/users": ("person",),
+    "/api/v1/users/persons/persons": ("orgtree",),
+}
+
+# поля, по которым подписываем связанную запись, в порядке предпочтения
+_RELATION_NAME_FIELDS = ("full_name", "name", "username", "title", "email")
 
 
 def _flatten_cell(value: Any) -> Any:
@@ -161,6 +189,276 @@ def _collect_filters(state_key: str, field_names: list[str]) -> list[dict]:
     return filters
 
 
+def _relation_label(item: Any) -> str:
+    """Короткая подпись связанной записи: ФИО или наименование + ИИН/БИН.
+
+    Связанные записи приходят целыми объектами, и в ячейке таблицы от них
+    пользы нет (см. _flatten_cell — там был бы сырой JSON), поэтому в таблицу
+    кладём подпись, а сам объект показываем в панели под таблицей."""
+    if not isinstance(item, dict):
+        return "" if item is None else str(item)
+
+    fio = " ".join(
+        str(item[field]).strip()
+        for field in ("last_name", "first_name", "middle_name")
+        if isinstance(item.get(field), str) and item[field].strip()
+    )
+    name = fio or next(
+        (
+            str(item[field]).strip() for field in _RELATION_NAME_FIELDS
+            if isinstance(item.get(field), str) and item[field].strip()
+        ),
+        "",
+    )
+    code = item.get("iin") or item.get("bin")
+    label = " ".join(part for part in (name, f"({code})" if code else "") if part)
+    if label:
+        return label
+    return f"#{item['id']}" if item.get("id") is not None else ""
+
+
+def _relation_items(value: Any) -> list[dict]:
+    """Связь как список записей: `person` приходит объектом, `orgtree` — списком."""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _relation_cell(value: Any) -> str:
+    """Значение колонки связи: подписи через «; », для пустой связи — «—»."""
+    items = _relation_items(value)
+    if not items:
+        return "—"
+    labels = [label for label in map(_relation_label, items) if label]
+    return "; ".join(labels) if labels else f"записей: {len(items)}"
+
+
+def _render_relations(
+    rows: list[dict], selected: list[int], joins: tuple[str, ...], state_key: str,
+) -> None:
+    """Связанные записи выбранной строки — полями, а не JSON в ячейке."""
+    st.markdown("#### 🔗 Связанные записи")
+    names = ", ".join(f"`{name}`" for name in joins)
+    if not selected:
+        st.caption(f"Выберите строку в таблице, чтобы увидеть {names}.")
+        return
+
+    row = rows[selected[0]]
+    for join in joins:
+        items = _relation_items(row.get(join))
+        st.markdown(f"**`{join}`** — записей: {len(items)}")
+        if not items:
+            st.caption("Связанных записей нет.")
+            continue
+        st.dataframe(
+            _to_dataframe(items), use_container_width=True, hide_index=True,
+            key=f"{state_key}::rel::{join}",
+        )
+
+
+def _field_comment(fields: list[dict], name: str) -> str:
+    """Описание поля из entity-meta — подпись понятнее голого имени колонки."""
+    for field in fields:
+        if field.get("name") == name:
+            return field.get("comment") or ""
+    return ""
+
+
+def _row_title(row: dict) -> str:
+    """Как назвать редактируемую запись: id + первое осмысленное имя."""
+    parts = [f"#{row['id']}"] if row.get("id") is not None else []
+    for field in ("name", "full_name", "title", "entity"):
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+            break
+    if row.get("bin"):
+        parts.append(f"БИН {row['bin']}")
+    return " · ".join(parts) or "запись"
+
+
+def _render_row_editor(
+    client: ApiClient, path: str, rows: list[dict], selected: list[int],
+    editable: tuple[str, ...], fields: list[dict], state_key: str,
+) -> None:
+    """Правка разрешённых полей выбранной строки (PATCH записи целиком не
+    трогаем — отправляем только изменённые поля, см. ApiClient.update)."""
+    st.markdown("#### ✏️ Редактирование")
+    names = ", ".join(f"`{name}`" for name in editable)
+    if not selected:
+        st.caption(f"Выберите строку в таблице, чтобы отредактировать {names}.")
+        return
+
+    row = rows[selected[0]]
+    record_id = row.get("id")
+    if record_id is None:
+        st.warning("У записи нет `id` — обновить её нельзя.")
+        return
+
+    st.caption(f"Запись: **{_row_title(row)}**")
+    values: dict[str, str] = {}
+    for name in editable:
+        key = f"{state_key}::edit::{record_id}::{name}"
+        if key not in st.session_state:
+            current = row.get(name)
+            st.session_state[key] = "" if current is None else str(current)
+        comment = _field_comment(fields, name)
+        values[name] = st.text_input(
+            f"{name} — {comment}" if comment else name, key=key,
+        )
+
+    changed = {
+        name: (value.strip() or None)
+        for name, value in values.items()
+        if (value.strip() or None) != (row.get(name) or None)
+    }
+    if changed:
+        st.caption(
+            f"`PATCH {path}/{record_id}` · тело: "
+            f"`{json.dumps(changed, ensure_ascii=False)}`"
+        )
+    else:
+        st.caption("Значение не изменено.")
+
+    save = st.button(
+        "💾 Сохранить", type="primary", key=f"{state_key}::save::{record_id}",
+        disabled=not changed, width="content",
+    )
+    if save and changed:
+        try:
+            with st.spinner("Сохранение..."):
+                updated = client.update(path, record_id, changed)
+        except ApiError as exc:
+            st.error(str(exc))
+            return
+        # правим строку прямо в загруженном ответе — таблица покажет новое
+        # значение без повторной загрузки всей страницы данных
+        for name, value in changed.items():
+            row[name] = updated.get(name, value) if isinstance(updated, dict) else value
+        st.success("Запись обновлена.")
+        st.rerun()
+
+
+def _parse_json_value(value: Any) -> Any:
+    """JSON-поле crud может вернуть объектом или JSON-строкой — приводим к объекту."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def _json_changes(old: Any, new: Any) -> list[str]:
+    """Что поменялось между старым и новым значением — по ключам верхнего
+    уровня (для signatures это отдельные подписи), внутри — по полям."""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return [] if old == new else ["значение заменено целиком"]
+    changes = [f"удалён ключ `{key}`" for key in old if key not in new]
+    changes += [f"добавлен ключ `{key}`" for key in new if key not in old]
+    for key in new:
+        if key not in old or old[key] == new[key]:
+            continue
+        before, after = old[key], new[key]
+        if isinstance(before, dict) and isinstance(after, dict):
+            fields = [f for f in (*before, *(f for f in after if f not in before))
+                      if before.get(f) != after.get(f)]
+            changes.append(f"`{key}`: поля {', '.join(f'`{f}`' for f in fields)}")
+        else:
+            changes.append(f"`{key}`: значение изменено")
+    return changes
+
+
+def _render_json_field_editor(
+    client: ApiClient, path: str, rows: list[dict], selected: list[int],
+    field: str, state_key: str,
+) -> None:
+    """Правка JSON-поля выбранной записи целиком (PATCH {field: <объект>}).
+
+    Значение берётся свежим GET записи, а не из строки таблицы: поле могли
+    не выбрать для загрузки, а с момента загрузки таблицы его могли поменять.
+    Перед сохранением показывается, что именно изменится, и нужна галочка —
+    PATCH идёт в боевой API."""
+    st.markdown(f"#### 🧾 Редактирование `{field}`")
+    if not selected:
+        st.caption(f"Выберите строку в таблице, чтобы отредактировать `{field}`.")
+        return
+
+    row = rows[selected[0]]
+    record_id = row.get("id")
+    if record_id is None:
+        st.warning("У записи нет `id` — обновить её нельзя.")
+        return
+
+    prefix = f"{state_key}::json::{field}::{record_id}"
+    record_key, text_key = f"{prefix}::record", f"{prefix}::text"
+    confirm_key, done_key = f"{prefix}::confirm", f"{prefix}::done"
+
+    st.caption(f"Запись: **{_row_title(row)}**")
+    if st.button("↻ Перечитать запись", key=f"{prefix}::reload", width="content"):
+        for key in (record_key, text_key, confirm_key):
+            st.session_state.pop(key, None)
+    if record_key not in st.session_state:
+        try:
+            with st.spinner("Загрузка записи..."):
+                st.session_state[record_key] = client.get_one(path, record_id)
+        except ApiError as exc:
+            st.error(str(exc))
+            return
+    record = st.session_state[record_key]
+    if not isinstance(record, dict):
+        st.warning("Неожиданный ответ на запрос записи.")
+        return
+
+    if st.session_state.pop(done_key, False):
+        st.success(f"`{field}` сохранено, запись перечитана.")
+
+    current = _parse_json_value(record.get(field))
+    if text_key not in st.session_state:
+        st.session_state[text_key] = json.dumps(current, ensure_ascii=False, indent=2)
+    edited = st.text_area(f"{field} (JSON)", key=text_key, height=400)
+
+    try:
+        parsed = json.loads(edited)
+    except (ValueError, TypeError) as exc:
+        st.error(f"Невалидный JSON: {exc}")
+        return
+    if parsed is not None and not isinstance(parsed, dict):
+        st.error("Ожидается JSON-объект (словарь) или null.")
+        return
+
+    changes = _json_changes(current, parsed)
+    if not changes:
+        st.caption("Значение не изменено.")
+        return
+    st.markdown(
+        f"Будет изменено (`PATCH {path}/{record_id}` на `{client.base_url}`):\n"
+        + "\n".join(f"- {change}" for change in changes)
+    )
+
+    confirm = st.checkbox("Подтверждаю запись в боевой API", key=confirm_key)
+    save = st.button(
+        "💾 Сохранить", type="primary", key=f"{prefix}::save",
+        disabled=not confirm, width="content",
+    )
+    if not save:
+        return
+    try:
+        with st.spinner("Сохранение..."):
+            client.update(path, record_id, {field: parsed})
+    except ApiError as exc:
+        st.error(str(exc))
+        return
+    # перечитываем запись, чтобы в редакторе было то, что реально сохранилось
+    row[field] = parsed
+    for key in (record_key, text_key, confirm_key):
+        st.session_state.pop(key, None)
+    st.session_state[done_key] = True
+    st.rerun()
+
+
 def render_registry(client: ApiClient, registry: dict) -> None:
     """Отрисовывает один реестр: поля (entity-meta) → выбор полей/фильтров → get-many."""
     path = registry["path"]
@@ -238,22 +536,41 @@ def render_registry(client: ApiClient, registry: dict) -> None:
         load = st.button("🔄 Загрузить", type="primary", use_container_width=True,
                          key=f"{state_key}::load")
 
+    joins = RELATION_JOINS.get(path, ())
+
     # данные загружаем только по явному нажатию кнопки «Загрузить»
     if load:
-        # fields не передаём — запрашиваем все доступные поля модели
-        params = crud_query.build_params(
-            page=int(page), limit=int(limit),
-            sort_field=None if sort_field.startswith("—") else sort_field,
-            sort_dir=sort_dir,
-            filters=filters,
-        )
+        def _params(with_joins: tuple[str, ...]) -> dict:
+            # fields не передаём — запрашиваем все доступные поля модели
+            return crud_query.build_params(
+                page=int(page), limit=int(limit),
+                sort_field=None if sort_field.startswith("—") else sort_field,
+                sort_dir=sort_dir,
+                filters=filters,
+                joins=list(with_joins) or None,
+            )
+
         try:
             with st.spinner("Загрузка данных..."):
-                result = client.get_many(path, params)
-            st.session_state[state_key] = result
+                result = client.get_many(path, _params(joins))
         except ApiError as exc:
-            st.error(str(exc))
-            return
+            # связь может быть не разрешена на бэкенде — тогда ошибку даёт
+            # именно join; реестр без связанных записей полезнее, чем ничего
+            if not joins:
+                st.error(str(exc))
+                return
+            st.warning(
+                f"Связанные записи ({', '.join(joins)}) загрузить не удалось, "
+                f"показываю реестр без них. Ошибка: {exc}"
+            )
+            joins = ()
+            try:
+                with st.spinner("Загрузка данных без связей..."):
+                    result = client.get_many(path, _params(()))
+            except ApiError as retry_exc:
+                st.error(str(retry_exc))
+                return
+        st.session_state[state_key] = result
 
     result = st.session_state.get(state_key)
     if not result:
@@ -274,15 +591,45 @@ def render_registry(client: ApiClient, registry: dict) -> None:
         st.info("Нет данных по заданным параметрам.")
         return
 
+    # связанные записи — подписью вместо сырого JSON в ячейке
+    loaded_joins = tuple(join for join in joins if join in df.columns)
+    for join in loaded_joins:
+        df[join] = [_relation_cell(row.get(join)) for row in rows]
+
     # показываем только выбранные колонки (из тех, что реально вернулись)
     cols = [c for c in display_fields if c in df.columns]
     view = df[cols] if cols else df
 
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    editable = EDITABLE_FIELDS.get(path, ())
+    json_editable = JSON_EDITABLE_FIELDS.get(path, ())
+    if not editable and not json_editable and not loaded_joins:
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        _export_buttons(view, entity)
+        return
+
+    # колонки связей и редактируемые поля добавляем принудительно: первых нет
+    # в entity-meta (а значит и в выборе колонок), вторые иначе не покажут
+    # результат правки, если колонку не выбрали для отображения
+    extra = [
+        c for c in (*loaded_joins, *editable)
+        if c in df.columns and c not in view.columns
+    ]
+    if extra:
+        view = df[[*view.columns, *extra]]
+
+    event = st.dataframe(
+        view, use_container_width=True, hide_index=True,
+        selection_mode="single-row", on_select="rerun", key=f"{state_key}::table",
+    )
     _export_buttons(view, entity)
+    selected = [i for i in event.selection.rows if i < len(rows)]
 
-    # разбор поля flow (реестр Processes) — панель под таблицей
-    flow_breakdown.render(rows, state_key, client)
-
-    # просмотр/редактирование input_fields (реестр Docs) — панель под таблицей
-    doc_input_fields.render(rows, state_key, client, path)
+    if loaded_joins:
+        st.divider()
+        _render_relations(rows, selected, loaded_joins, state_key)
+    if editable:
+        st.divider()
+        _render_row_editor(client, path, rows, selected, editable, fields, state_key)
+    for field in json_editable:
+        st.divider()
+        _render_json_field_editor(client, path, rows, selected, field, state_key)

@@ -158,6 +158,13 @@ class ApiClient:
             resp = self._send("PATCH", url, json=body, headers=self._headers())
         return resp
 
+    def _post(self, path: str, body: dict[str, Any] | None = None) -> requests.Response:
+        url = self.base_url + path
+        resp = self._send("POST", url, json=body, headers=self._headers())
+        if resp.status_code == 401 and self._do_refresh():
+            resp = self._send("POST", url, json=body, headers=self._headers())
+        return resp
+
     def get_many(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Возвращает нормализованный ответ get-many: {data, total, page, count, pageCount}."""
         try:
@@ -226,6 +233,75 @@ class ApiClient:
             raise ApiError("Сессия истекла, войдите заново.")
         if resp.status_code >= 400:
             raise ApiError(f"Ошибка обновления ({resp.status_code}): {resp.text[:300]}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise ApiError("Сервер вернул не-JSON.") from exc
+
+    def post(self, path: str, body: dict[str, Any] | None = None) -> Any:
+        """POST {path} с телом body — вызов произвольного эндпоинта (например
+        интеграции elicense) с авторизацией и авто-refresh при 401."""
+        try:
+            resp = self._post(path, body)
+        except requests.RequestException as exc:
+            raise ApiError(f"Сеть недоступна: {exc}") from exc
+        if resp.status_code == 401:
+            raise ApiError("Сессия истекла, войдите заново.")
+        if resp.status_code >= 400:
+            raise ApiError(f"Ошибка вызова ({resp.status_code}): {resp.text[:300]}")
+        try:
+            return resp.json()
+        except ValueError:
+            return resp.text
+
+    # --- elicense test-files (отладка интеграции) -------------------------
+    # Без Bearer-токена — эти эндпоинты, судя по всему, не требуют авторизации.
+    def search_test_files(self, text: str) -> Any:
+        """POST {base_url}/elicense/test-files/search-by-content — список тестовых
+        файлов elicense, чьё содержимое включает text (например, никад)."""
+        url = self.base_url + "/elicense/test-files/search-by-content"
+        try:
+            resp = self._send(
+                "POST", url, json={"text": text}, timeout=config.TEST_FILES_TIMEOUT,
+                headers={"accept": "application/json", "Content-Type": "application/json"},
+            )
+        except requests.RequestException as exc:
+            raise ApiError(f"Сеть недоступна: {exc}") from exc
+        if resp.status_code >= 400:
+            raise ApiError(f"Ошибка поиска файлов ({resp.status_code}): {resp.text[:300]}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise ApiError("Сервер вернул не-JSON.") from exc
+
+    def download_test_file(self, filename: str) -> str:
+        """GET {base_url}/elicense/test-files/download/{filename} — содержимое файла."""
+        url = self.base_url + f"/elicense/test-files/download/{filename}"
+        try:
+            resp = self._send(
+                "GET", url, headers={"accept": "application/json"},
+                timeout=config.TEST_FILES_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise ApiError(f"Сеть недоступна: {exc}") from exc
+        if resp.status_code >= 400:
+            raise ApiError(f"Ошибка загрузки файла ({resp.status_code}): {resp.text[:300]}")
+        return resp.text
+
+    def search_test_files_by_date_range(self, start: str, end: str) -> Any:
+        """POST {base_url}/elicense/test-files/search-by-date-range — список
+        тестовых файлов elicense за период. start/end — строки формата
+        «ДД.ММ.ГГГГ ЧЧ:ММ» (см. xml_files.format_date)."""
+        url = self.base_url + "/elicense/test-files/search-by-date-range"
+        try:
+            resp = self._send(
+                "POST", url, json={"start": start, "end": end}, timeout=config.TEST_FILES_TIMEOUT,
+                headers={"accept": "application/json", "Content-Type": "application/json"},
+            )
+        except requests.RequestException as exc:
+            raise ApiError(f"Сеть недоступна: {exc}") from exc
+        if resp.status_code >= 400:
+            raise ApiError(f"Ошибка поиска файлов ({resp.status_code}): {resp.text[:300]}")
         try:
             return resp.json()
         except ValueError as exc:

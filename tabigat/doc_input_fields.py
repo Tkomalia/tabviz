@@ -1,11 +1,9 @@
-"""Просмотр и редактирование поля `input_fields` реестра Docs.
+"""Просмотр и редактирование `input_fields` документов, связанных с процессом.
 
-Аналогично flow_breakdown для Processes: панель появляется под таблицей
-автоматически, если в загруженных строках есть разбираемое поле input_fields.
-В отличие от flow_breakdown, редактирование мутирует данные на бэкенде,
-поэтому дополнительно привязано к конкретному пути реестра (DOCS_PATH) —
-иначе PATCH мог бы улететь не туда для реестров с похожим по имени полем
-(например doc-templates тоже имеет input_fields).
+Процесс (реестр Processes) хранит связанные документы в поле `docs` —
+списке UUID (может быть пустым). Для каждого id документ подгружается через
+GET /api/v1/docs/main/docs/{id} (с кэшем в session_state), после чего можно
+посмотреть и сохранить (PATCH) его input_fields.
 
 У input_fields нет задокументированной схемы (маппинга UUID→имя поля),
 поэтому редактируется как plain JSON.
@@ -33,41 +31,68 @@ def _parse_object(value: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _row_label(row: dict, index: int) -> str:
-    rid = row.get("id")
-    label = f"#{rid}" if rid is not None else f"[{index}]"
-    name = row.get("name")
+def _fetch_docs(client: ApiClient, doc_ids: list[str], cache: dict) -> list[dict]:
+    """Подгружает документы по id (с кэшем); документы с ошибкой загрузки
+    пропускаются (ошибка выводится отдельным предупреждением)."""
+    docs: list[dict] = []
+    for doc_id in doc_ids:
+        if doc_id not in cache:
+            try:
+                cache[doc_id] = client.get_one(DOCS_PATH, doc_id)
+            except ApiError as exc:
+                cache[doc_id] = exc
+        entry = cache[doc_id]
+        if isinstance(entry, ApiError):
+            st.warning(f"Документ `{doc_id}` не загружен: {entry}")
+            continue
+        docs.append(entry)
+    return docs
+
+
+def _doc_label(doc: dict, index: int) -> str:
+    doc_id = doc.get("id")
+    label = f"#{doc_id}" if doc_id is not None else f"[{index}]"
+    name = doc.get("name")
     if isinstance(name, str) and name.strip():
         label += f" — {name.strip()}"
     return label
 
 
-def render(rows: list[dict], state_key: str, client: ApiClient, path: str) -> None:
-    """Панель просмотра/редактирования input_fields; активна только для реестра Docs."""
-    if path != DOCS_PATH:
-        return
-
-    candidates = [
-        (row, parsed)
-        for row in rows
-        if row.get("id") is not None
-        for parsed in (_parse_object(row.get(_FIELD)),)
-        if parsed is not None
-    ]
-    if not candidates:
-        return
-
+def render(doc_ids: list[str], state_key: str, client: ApiClient) -> None:
+    """Панель просмотра/редактирования input_fields документов процесса."""
     st.divider()
-    st.markdown("### 📝 input_fields документа")
+    st.markdown("### 📝 input_fields документов процесса")
+
+    if not doc_ids:
+        st.info("У процесса нет связанных документов (поле `docs` пусто).")
+        return
+
     st.caption(
-        "Содержимое `input_fields` выбранной записи — можно отредактировать "
+        "Документы из поля `docs` процесса — можно отредактировать `input_fields` "
         "как JSON и сохранить (`PATCH " + DOCS_PATH + "/{id}`)."
     )
 
-    options = [_row_label(row, i) for i, (row, _) in enumerate(candidates)]
+    cache = st.session_state.setdefault(f"{state_key}::inputfieldsdoccache", {})
+    with st.spinner("Загрузка документов..."):
+        docs = _fetch_docs(client, doc_ids, cache)
+    if not docs:
+        st.info("Ни один документ не загрузился.")
+        return
+
+    candidates = [
+        (doc, parsed)
+        for doc in docs
+        for parsed in (_parse_object(doc.get(_FIELD)),)
+        if parsed is not None
+    ]
+    if not candidates:
+        st.info("Ни у одного документа нет разбираемого input_fields.")
+        return
+
+    options = [_doc_label(doc, i) for i, (doc, _) in enumerate(candidates)]
     choice = st.selectbox("Документ", options, key=f"{state_key}::docpick")
-    row, parsed = candidates[options.index(choice)]
-    doc_id = row["id"]
+    doc, parsed = candidates[options.index(choice)]
+    doc_id = doc["id"]
 
     text_key = f"{state_key}::inputfields::{doc_id}"
     if text_key not in st.session_state:
@@ -100,6 +125,8 @@ def render(rows: list[dict], state_key: str, client: ApiClient, path: str) -> No
         except ApiError as exc:
             st.error(str(exc))
         else:
-            row[_FIELD] = updated.get(_FIELD, parsed_edit) if isinstance(updated, dict) else parsed_edit
+            new_value = updated.get(_FIELD, parsed_edit) if isinstance(updated, dict) else parsed_edit
+            doc[_FIELD] = new_value
+            cache[doc_id] = doc
             st.success("input_fields обновлены.")
             st.rerun()
